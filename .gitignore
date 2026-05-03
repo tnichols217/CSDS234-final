@@ -1,3 +1,6 @@
 .env
 __pycache__
 viz
+result
+.direnv
+data
