@@ -1,40 +1,59 @@
 
 CREATE EXTENSION postgis;
 
+-- Table for managing groups and subgroups of geometry data
 CREATE TABLE meta (
     runid BIGSERIAL PRIMARY KEY,
+    -- Which US State this metagroup is for
     state INT NOT NULL,
+    -- type 0, level 0 represents the top level counties
+    -- Number of layers to perform
     type INT NOT NULL,
-    previd INT,
+    -- Previous metaid for referenccing higher layers
+    previd BIGINT,
+    -- Which layer of clustering this metagroup is, once it reaches `type`, it is complete
     level INT NOT NULL,
-    size INT
+    -- Number of target elements within this metagroup
+    size INT,
+    -- Which election cycle this is from, null for higher order groupings
+    election_year INT
 );
 
 CREATE INDEX meta_idx ON meta (runid, state);
 
+-- Table for representing each outline
 CREATE TABLE groups (
     groupid BIGSERIAL PRIMARY KEY,
     runid BIGINT NOT NULL,
-    geo GEOMETRY NOT NULL,
+    -- Actual outline geometry, could be grouped or not
+    geo GEOMETRY(MultiPolygon, 4269) NOT NULL,
+    -- Votes
     dem INT NOT NULL,
     rep INT NOT NULL,
     total INT NOT NULL,
+    -- Reference the meta table to be discoverable
     FOREIGN KEY (runid) REFERENCES meta(runid)
 );
 
 CREATE INDEX groups_idx ON groups (groupid, runid);
 
+-- Top level result group for final cluster results
 CREATE TABLE result_group (
     resid BIGSERIAL PRIMARY KEY,
+    -- Which layers were used for this clustering run
     layers INT[2][] NOT NULL,
-    runid BIGINT NOT NULL
+    -- The group of original counties used for this clustering
+    runid BIGINT NOT NULL,
+    FOREIGN KEY (runid) REFERENCES meta(runid)
 );
 
 CREATE INDEX result_group_idx ON result_group (resid);
 
 CREATE TABLE results (
+    -- The runid of the top level grouping for the results
     runid BIGINT PRIMARY KEY,
     resid BIGINT NOT NULL,
+    -- Seat counts
     dem INT NOT NULL,
     rep INT NOT NULL,
     total INT NOT NULL,
@@ -44,7 +63,79 @@ CREATE TABLE results (
 
 CREATE INDEX results_idx ON results (runid, resid);
 
-CREATE FUNCTION cluster_group(v_previd BIGINT, v_size INT, v_seed DOUBLE PRECISION, v_type INT DEFAULT -1)
+CREATE TABLE state_lookup (
+    fips_code INT PRIMARY KEY,
+    state_name VARCHAR(50) NOT NULL,
+    abbreviation CHAR(2)
+);
+
+CREATE INDEX states_idx ON state_lookup (fips_code);
+
+-- Define our state lookup table
+INSERT INTO state_lookup (fips_code, state_name, abbreviation) VALUES
+    (1, 'Alabama', 'AL'),
+    (2, 'Alaska', 'AK'),
+    (3, 'American Samoa', 'AS'),
+    (4, 'Arizona', 'AZ'),
+    (5, 'Arkansas', 'AR'),
+    (6, 'California', 'CA'),
+    (8, 'Colorado', 'CO'),
+    (9, 'Connecticut', 'CT'),
+    (10, 'Delaware', 'DE'),
+    (11, 'District of Columbia', 'DC'),
+    (12, 'Florida', 'FL'),
+    (13, 'Georgia', 'GA'),
+    (15, 'Hawaii', 'HI'),
+    (16, 'Idaho', 'ID'),
+    (17, 'Illinois', 'IL'),
+    (18, 'Indiana', 'IN'),
+    (19, 'Iowa', 'IA'),
+    (20, 'Kansas', 'KS'),
+    (21, 'Kentucky', 'KY'),
+    (22, 'Louisiana', 'LA'),
+    (23, 'Maine', 'ME'),
+    (24, 'Maryland', 'MD'),
+    (25, 'Massachusetts', 'MA'),
+    (26, 'Michigan', 'MI'),
+    (27, 'Minnesota', 'MN'),
+    (28, 'Mississippi', 'MS'),
+    (29, 'Missouri', 'MO'),
+    (30, 'Montana', 'MT'),
+    (31, 'Nebraska', 'NE'),
+    (32, 'Nevada', 'NV'),
+    (33, 'New Hampshire', 'NH'),
+    (34, 'New Jersey', 'NJ'),
+    (35, 'New Mexico', 'NM'),
+    (36, 'New York', 'NY'),
+    (37, 'North Carolina', 'NC'),
+    (38, 'North Dakota', 'ND'),
+    (39, 'Ohio', 'OH'),
+    (40, 'Oklahoma', 'OK'),
+    (41, 'Oregon', 'OR'),
+    (42, 'Pennsylvania', 'PA'),
+    (44, 'Rhode Island', 'RI'),
+    (45, 'South Carolina', 'SC'),
+    (46, 'South Dakota', 'SD'),
+    (47, 'Tennessee', 'TN'),
+    (48, 'Texas', 'TX'),
+    (49, 'Utah', 'UT'),
+    (50, 'Vermont', 'VT'),
+    (51, 'Virginia', 'VA'),
+    (53, 'Washington', 'WA'),
+    (54, 'West Virginia', 'WV'),
+    (55, 'Wisconsin', 'WI'),
+    (56, 'Wyoming', 'WY'),
+    (60, 'American Samoa', 'AS'),
+    (64, 'Federated States of Micronesia', 'FM'),
+    (66, 'Guam', 'GU'),
+    (68, 'Marshall Islands', 'MH'),
+    (69, 'Northern Mariana Islands', 'MP'),
+    (70, 'Palau', 'PW'),
+    (72, 'Puerto Rico', 'PR'),
+    (74, 'U.S. Minor Outlying Islands', 'UM'),
+    (78, 'Virgin Islands', 'VI');
+
+CREATE OR REPLACE FUNCTION cluster_group(v_previd BIGINT, v_size INT, v_seed DOUBLE PRECISION, v_type INT DEFAULT -1)
 RETURNS BIGINT AS $$
 DECLARE
     v_runid BIGINT;
@@ -82,7 +173,7 @@ BEGIN
                 ST_ClusterKMeans(
                     ST_Force4D(
                         ST_Force3DZ(ST_GeneratePoints(g.geo, 1, (100000*random()+1)::INT), 0.15*random()),
-                        mvalue => 1000*random() -- set clustering to be weighed by population
+                        mvalue => 1000*random()
                     ),
                     v_size
                 ) OVER () AS clustering
@@ -96,7 +187,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE FUNCTION create_layers(layers INT[2][], prevrunid BIGINT)
+CREATE OR REPLACE FUNCTION create_layers(layers INT[2][], prevrunid BIGINT)
 RETURNS BIGINT AS $$
 DECLARE
     v_type INT;
@@ -108,7 +199,7 @@ BEGIN
     v_type := array_length(layers, 1);
 
     FOR i IN 1..v_type
-	LOOP
+    LOOP
         CREATE TEMP TABLE temp_nextrunids (runid BIGINT);
 
         WITH runid_groups AS (
@@ -148,29 +239,56 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE FUNCTION initialize()
-RETURNS VOID
-AS $$
+CREATE OR REPLACE FUNCTION initialize()
+RETURNS VOID AS $$
 BEGIN
-    CREATE TABLE transformed AS
+    -- Create a unified temporary table for both years
+    CREATE TEMP TABLE transformed_unified AS
+    -- Pull 2020 Data
     SELECT
-        ogc_fid AS id,
-        ST_CollectionExtract(ST_MakeValid(ST_GeomFromWKB(wkb_geometry))) AS geo,
-        substring(geoid from 1 for 2)::INT AS state,
-        substring(geoid from 3 for 3)::INT AS county,
+        2020 AS year,
+        ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_GeomFromWKB(wkb_geometry)), 3))::geometry(MultiPolygon, 4269) AS geo,
+        substring(geoid from 1 for 2)::INT AS state_id,
+        substring(geoid from 3 for 3)::INT AS county_id,
         votes_dem AS dem,
         votes_rep AS rep,
         votes_total AS total
-    from jerry;
+    FROM raw2020
+    
+    UNION ALL
+    
+    -- Pull 2024 Data
+    SELECT
+        2024 AS year,
+        ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_GeomFromWKB(wkb_geometry)), 3))::geometry(MultiPolygon, 4269) AS geo,
+        substring(geoid from 1 for 2)::INT AS state_id,
+        substring(geoid from 3 for 3)::INT AS county_id,
+        votes_dem AS dem,
+        votes_rep AS rep,
+        votes_total AS total
+    FROM raw2024;
 
-    INSERT INTO meta (state, type, level)
-        SELECT state, 0, 0
-        FROM transformed
-        GROUP BY state;
+    -- Insert into meta (Level 0) for all years and states present
+    INSERT INTO meta (state, type, level, election_year, size)
+    SELECT state_id, 0, 0, year, COUNT(*)
+    FROM transformed_unified
+    GROUP BY state_id, year;
 
+    -- Map shapes into groups, joining on state AND year to ensure correct lineage
     INSERT INTO groups (runid, geo, dem, rep, total)
-        SELECT m.runid, t.geo, COALESCE(t.dem, 0), COALESCE(t.rep, 0), COALESCE(t.total, 0)
-        FROM transformed AS t
-        JOIN meta AS m ON t.state = m.state;
+    SELECT 
+        m.runid, 
+        t.geo, 
+        COALESCE(t.dem, 0), 
+        COALESCE(t.rep, 0), 
+        COALESCE(t.total, 0)
+    FROM transformed_unified AS t
+    JOIN meta AS m ON (t.state_id = m.state AND t.year = m.election_year)
+    WHERE m.level = 0;
+
+    -- Cleanup
+    DROP TABLE transformed_unified;
+    DROP TABLE raw2020;
+    DROP TABLE raw2024;
 END;
-$$ LANGUAGE plpgsql
+$$ LANGUAGE plpgsql;
