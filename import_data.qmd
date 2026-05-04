@@ -68,9 +68,9 @@ con.close()
 ```
 
 ```{python}
-##################################
-### Import all Data ###
-##################################
+#######################################
+### Import all Data (only run once) ###
+#######################################
 
 con = activateCon()
 cur = con.cursor()
@@ -81,6 +81,71 @@ display(gpd.GeoDataFrame(cur.execute('''
 
 con.commit()
 con.close()
+```
+
+```{python}
+######################################
+### Define state and county runids ###
+######################################
+
+con = activateCon()
+cur = con.cursor()
+state_county_data = gpd.GeoDataFrame(cur.execute('''
+    WITH precinct_runs AS (
+        SELECT 
+            m.state, 
+            m.election_year as year, 
+            m.runid, 
+            COUNT(g.groupid) as size
+        FROM meta m
+        JOIN groups g ON m.runid = g.runid
+        WHERE m.type = 0
+        GROUP BY m.state, m.election_year, m.runid
+    ),
+    county_runs AS (
+        SELECT 
+            m.state, 
+            m.election_year as year, 
+            m.runid, 
+            COUNT(g.groupid) as size
+        FROM meta m
+        JOIN groups g ON m.runid = g.runid
+        WHERE m.type = 1 AND m.level = 1
+        GROUP BY m.state, m.election_year, m.runid
+    )
+    SELECT 
+        s.abbreviation as state,
+        p.year,
+        p.runid AS runid_precinct,
+        p.size AS size_precinct,
+        c.runid AS runid_county,
+        c.size AS size_county
+    FROM precinct_runs p
+    JOIN county_runs c ON p.state = c.state AND p.year = c.year
+    JOIN state_lookup s ON p.state = s.fips_code
+    ORDER BY s.abbreviation, p.year;
+''').fetchall(), columns=["state", "year", "runid_precinct", "size_precinct", "runid_county", "size_county"])
+
+# Example query from this table
+# state_county_data[(state_county_data["state"] == "OH") & (state_county_data["year"] == 2024)]
+
+display(state_county_data)
+con.close()
+
+```
+
+```{python}
+###################
+### Define Runs ###
+###################
+
+state_county_data["cluster_factor"] = np.int32(np.round(np.sqrt(state_county_data["size_precinct"] * state_county_data["size_county"])))
+
+def make_array_str(sc_line: gpd.GeoDataFrame, iterations=30):
+    return f"{{{{{int(sc_line['cluster_factor'].iloc[0])}, {iterations}}}, {{{int(sc_line['size_county'].iloc[0])}, {iterations}}}}}"
+
+# Sample usage:
+# make_array_str(state_county_data[(state_county_data["state"] == "OH") & (state_county_data["year"] == 2024)])
 ```
 
 ```{python}
@@ -108,24 +173,12 @@ def aawait(f):
 ### Async Run State Simulations (May take a long time) ###
 ##########################################################
 
-runs = {
-    "ohio": ["{{880, 30}, {88, 30}}", 25], # Ohio 30x30 trial
-    "california": ["{{500, 30}, {58, 30}}", 24], # California 30x30 trial
-    "wisconsin": ["{{700, 30}, {72, 30}}", 44], # Wisconsin 30x30 trial
-    "penns": ["{{700, 30}, {67, 30}}", 3], # Penns 30x30 trial
-    "nevada": ["{{200, 30}, {17, 30}}", 33], # Nevada 30x30 trial
-    "arizona": ["{{150, 30}, {15, 30}}", 19], # Arizona 30x30 trial
-    "illinois": ["{{1000, 30}, {102, 30}}", 12], # Illinois 30x30 trial
-    "texas": ["{{1000, 30}, {254, 30}}", 8], # Texas 30x30 trial
-    "kansas": ["{{700, 30}, {105, 30}}", 41] # Kansas 30x30 trial
-}
-
 @asyn
-def do_state(runid):
+def do_state(sc_line: gpd.GeoDataFrame):
     global runs
     con = activateCon()
     cur = con.cursor()
-    id = cur.execute("select create_layers(%(layers)s::INT[][], %(runid)s);", {'layers': runs[runid][0], 'runid': runs[runid][1]}).fetchall()[0][0]
+    id = cur.execute("select create_layers(%(layers)s::INT[][], %(runid)s);", {'layers': make_array_str(sc_line), 'runid': sc_line["runid_precinct"].iloc[0]}).fetchall()[0][0]
     con.commit()
     con.close()
     print(id)
