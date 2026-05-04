@@ -244,29 +244,49 @@ RETURNS VOID AS $$
 BEGIN
     -- Create a unified temporary table for both years
     CREATE TEMP TABLE transformed_unified AS
-    -- Pull 2020 Data
-    SELECT
-        2020 AS year,
-        ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_GeomFromWKB(wkb_geometry)), 3))::geometry(MultiPolygon, 4269) AS geo,
-        substring(geoid from 1 for 2)::INT AS state_id,
-        substring(geoid from 3 for 3)::INT AS county_id,
-        votes_dem AS dem,
-        votes_rep AS rep,
-        votes_total AS total
-    FROM raw2020
-    
-    UNION ALL
-    
-    -- Pull 2024 Data
-    SELECT
-        2024 AS year,
-        ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_GeomFromWKB(wkb_geometry)), 3))::geometry(MultiPolygon, 4269) AS geo,
-        substring(geoid from 1 for 2)::INT AS state_id,
-        substring(geoid from 3 for 3)::INT AS county_id,
-        votes_dem AS dem,
-        votes_rep AS rep,
-        votes_total AS total
-    FROM raw2024;
+        -- Pull 2020 Data
+        SELECT
+            2020 AS year,
+            ST_Multi(ST_CollectionExtract(ST_MakeValid(
+                -- Use ST_GeomFromEWKB to handle the PostGIS-specific format
+                -- We wrap in ST_SetSRID(..., 4326) only if the EWKB SRID is 0
+                ST_Transform(
+                    CASE 
+                        WHEN ST_SRID(ST_GeomFromEWKB(wkb_geometry)) = 0 
+                        THEN ST_SetSRID(ST_GeomFromEWKB(wkb_geometry), 4326)
+                        ELSE ST_GeomFromEWKB(wkb_geometry)
+                    END, 
+                    4269
+                )
+            ), 3))::geometry(MultiPolygon, 4269) AS geo,
+            substring(geoid from 1 for 2)::INT AS state_id,
+            substring(geoid from 3 for 3)::INT AS county_id,
+            votes_dem AS dem,
+            votes_rep AS rep,
+            votes_total AS total
+        FROM raw2020
+        
+        UNION ALL
+        
+        -- Pull 2024 Data
+        SELECT
+            2024 AS year,
+            ST_Multi(ST_CollectionExtract(ST_MakeValid(
+                ST_Transform(
+                    CASE 
+                        WHEN ST_SRID(ST_GeomFromEWKB(wkb_geometry)) = 0 
+                        THEN ST_SetSRID(ST_GeomFromEWKB(wkb_geometry), 4326)
+                        ELSE ST_GeomFromEWKB(wkb_geometry)
+                    END, 
+                    4269
+                )
+            ), 3))::geometry(MultiPolygon, 4269) AS geo,
+            substring(geoid from 1 for 2)::INT AS state_id,
+            substring(geoid from 3 for 3)::INT AS county_id,
+            votes_dem AS dem,
+            votes_rep AS rep,
+            votes_total AS total
+        FROM raw2024;
 
     -- Insert into meta (Level 0) for all years and states present
     INSERT INTO meta (state, type, level, election_year, size)
@@ -285,6 +305,26 @@ BEGIN
     FROM transformed_unified AS t
     JOIN meta AS m ON (t.state_id = m.state AND t.year = m.election_year)
     WHERE m.level = 0;
+
+    -- Insert the real county distribution from the dataset
+    INSERT INTO meta (state, type, level, election_year, size, previd)
+    SELECT m.state, 1, 1, m.election_year, 
+           (SELECT COUNT(DISTINCT county_id) FROM transformed_unified WHERE state_id = m.state AND year = m.election_year),
+           m.runid
+    FROM meta m WHERE m.level = 0;
+
+    -- Populate the group table with the actual merged county shapes
+    INSERT INTO groups (runid, geo, dem, rep, total)
+    SELECT 
+        m_child.runid,
+        ST_Multi(ST_Union(t.geo)), -- Merge all precincts in the same county
+        SUM(t.dem),
+        SUM(t.rep),
+        SUM(t.total)
+    FROM transformed_unified t
+    JOIN meta m_parent ON (t.state_id = m_parent.state AND t.year = m_parent.election_year AND m_parent.level = 0)
+    JOIN meta m_child ON (m_child.previd = m_parent.runid AND m_child.level = 1)
+    GROUP BY m_child.runid, t.county_id;
 
     -- Cleanup
     DROP TABLE transformed_unified;
