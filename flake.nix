@@ -11,6 +11,29 @@
         allowUnfree = true;
       };
     };
+    contextily = pkgs.python3Packages.buildPythonPackage rec {
+      pname = "contextily";
+      version = "1.7.0";
+      src = pkgs.python3Packages.fetchPypi {
+        inherit pname version;
+        sha256 = "sha256-ZTT6pXAribRtDYG0xTh1Ty2LPdjMKYRUsRzO36Z+c6w=";
+      };
+      pyproject = true;
+      build-system = [ pkgs.python3Packages.setuptools ];
+      propagatedBuildInputs = with pkgs.python3Packages; [
+        geopy
+        joblib
+        matplotlib
+        mercantile
+        numpy
+        pillow
+        rasterio
+        requests
+        xyzservices
+        setuptools-scm
+      ];
+      doCheck = false; # Skip tests to save time
+    };
     in
     {
       devShells = rec {
@@ -40,6 +63,7 @@
               psycopg
               folium
               mapclassify
+              contextily
             ]))
           ];
         };

@@ -240,9 +240,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION initialize()
-RETURNS BIGINT AS $$
-DECLARE
-    v_resid BIGINT;
+RETURNS VOID AS $$
 BEGIN
     -- Create a unified temporary table for both years
     CREATE TEMP TABLE transformed_unified AS
@@ -328,36 +326,32 @@ BEGIN
     JOIN meta m_child ON (m_child.previd = m_parent.runid AND m_child.level = 1)
     GROUP BY m_child.runid, t.county_id;
 
-    -- Create a result group for the actual clustering
-    INSERT INTO result_group (layers, runid, election_year)
-    SELECT 
-        '{{0,0}}'::INT[], 
-        m.runid, 
-        m.election_year
-    FROM meta m
-    WHERE m.level = 1 AND m.type = 1
-    RETURNING resid INTO v_resid;
-
-    -- Calculate who won and insert into results
+    WITH inserted_groups AS (
+        INSERT INTO result_group (layers, runid)
+        SELECT 
+            '{{0,0}}'::INT[], -- Baseline marker
+            runid
+        FROM meta
+        WHERE type = 1 AND level = 1
+        RETURNING resid, runid
+    )
     INSERT INTO results (runid, resid, dem, rep, total)
     SELECT
         g.runid,
-        v_resid,
-        SUM(CASE WHEN g.dem > g.rep THEN 1 ELSE 0 END) AS dem_seats,
-        SUM(CASE WHEN g.rep > g.dem THEN 1 ELSE 0 END) AS rep_seats,
-        COUNT(*) AS total_seats
+        ig.resid,
+        -- Count counties won by Dems
+        SUM(CASE WHEN g.dem > g.rep THEN 1 ELSE 0 END),
+        -- Count counties won by Reps
+        SUM(CASE WHEN g.rep > g.dem THEN 1 ELSE 0 END),
+        -- Total number of counties
+        COUNT(*)
     FROM groups g
-    JOIN meta m ON g.runid = m.runid
-    WHERE m.level = 1 AND m.type = 1
-    GROUP BY g.runid;
-
-    DROP TABLE transformed_unified;
+    JOIN inserted_groups ig ON g.runid = ig.runid
+    GROUP BY g.runid, ig.resid;
 
     -- Cleanup
     DROP TABLE transformed_unified;
     DROP TABLE raw2020;
     DROP TABLE raw2024;
-
-    return v_resid;
 END;
 $$ LANGUAGE plpgsql;

@@ -1,0 +1,572 @@
+---
+jupyter: python3
+---
+
+```{python}
+####################
+### Dependencies ###
+####################
+
+import requests as rq
+import dotenv
+import os
+import json
+import pandas as pd
+import geopandas as gpd
+from io import StringIO
+from IPython.display import display
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from matplotlib.colors import Normalize
+from matplotlib.ticker import MaxNLocator
+from bs4 import BeautifulSoup as bs
+import sqlite3 as sql
+import psycopg as pg
+import asyncio
+import nest_asyncio
+from scipy.stats import norm
+import numpy as np
+import subprocess
+import math
+import contextily as cx
+```
+
+```{python}
+#####################
+### General Setup ###
+#####################
+
+nest_asyncio.apply()
+env = dotenv.dotenv_values()
+POSTGRES_DB = env["POSTGRES_DB"]
+POSTGRES_USER = env["POSTGRES_USER"]
+POSTGRES_PASSWORD = env["POSTGRES_PASSWORD"]
+POSTGRES_ENDPOINT = env["POSTGRES_ENDPOINT"]
+```
+
+```{python}
+#################################################
+### Setup PostgreSQL connection and Constants ###
+#################################################
+
+# Make a connection to the database
+activateCon = lambda : pg.Connection.connect(env["DB_URI"], cursor_factory=pg.ClientCursor)
+con = activateCon()
+cur = con.cursor()
+```
+
+```{python}
+##################################
+### Test PostgreSQL Connection ###
+##################################
+
+con = activateCon()
+cur = con.cursor()
+
+display(gpd.GeoDataFrame(cur.execute('''
+    SELECT * FROM meta;
+''').fetchall()))
+
+con.close()
+```
+
+```{python}
+#######################################
+### Import all Data (only run once) ###
+#######################################
+
+con = activateCon()
+cur = con.cursor()
+
+actual_county_runid = gpd.GeoDataFrame(cur.execute('''
+    SELECT initialize();
+''').fetchall())
+
+con.commit()
+con.close()
+```
+
+```{python}
+######################################
+### Define state and county runids ###
+######################################
+
+con = activateCon()
+cur = con.cursor()
+state_county_data = gpd.GeoDataFrame(cur.execute('''
+        WITH precinct_runs AS (
+            SELECT 
+                m.state, 
+                m.election_year as year, 
+                m.runid, 
+                COUNT(g.groupid) as size
+            FROM meta m
+            JOIN groups g ON m.runid = g.runid
+            WHERE m.type = 0
+            GROUP BY m.state, m.election_year, m.runid
+        ),
+        county_runs AS (
+            SELECT 
+                m.state, 
+                m.election_year as year, 
+                m.runid, 
+                COUNT(g.groupid) as size
+            FROM meta m
+            JOIN groups g ON m.runid = g.runid
+            WHERE m.type = 1 AND m.level = 1
+            GROUP BY m.state, m.election_year, m.runid
+        )
+        SELECT 
+            s.abbreviation as state,
+            p.year,
+            p.runid AS runid_precinct,
+            p.size AS size_precinct,
+            c.runid AS runid_county,
+            c.size AS size_county,
+            r.dem AS dem,
+            r.rep AS rep
+        FROM precinct_runs p
+        JOIN county_runs c ON p.state = c.state AND p.year = c.year
+        JOIN state_lookup s ON p.state = s.fips_code
+        JOIN results r ON c.runid = r.runid
+        ORDER BY s.abbreviation, p.year;
+    ''').fetchall(),
+    columns=[
+        "state",
+        "year",
+        "runid_precinct",
+        "size_precinct",
+        "runid_county",
+        "size_county",
+        "dem",
+        "rep"
+    ]
+)
+
+# Example query from this table
+# state_county_data[(state_county_data["state"] == "OH") & (state_county_data["year"] == 2024)]
+
+display(state_county_data)
+con.close()
+
+```
+
+```{python}
+###################
+### Define Runs ###
+###################
+
+state_county_data["cluster_factor"] = np.int32(np.round(np.sqrt(state_county_data["size_precinct"] * state_county_data["size_county"])))
+
+def make_array_str(sc_line: gpd.GeoDataFrame, iterations=30):
+    return f"{{{{{int(sc_line['cluster_factor'])}, {iterations}}}, {{{int(sc_line['size_county'])}, {iterations}}}}}"
+
+display(state_county_data)
+# Sample usage:
+# make_array_str(state_county_data[(state_county_data["state"] == "OH") & (state_county_data["year"] == 2024)])
+```
+
+```{python}
+##############################
+### Define Async Functions ###
+##############################
+
+loop = asyncio.get_event_loop()
+
+# Define asynchronous function decorator to allow for asynchronous execution within the loop
+def asyn(f):
+    global loop
+    def wrapped(*args, **kwargs):
+        global loop
+        return loop.run_in_executor(None, f, *args, **kwargs)
+    return wrapped
+
+def aawait(f):
+    global loop
+    return loop.run_until_complete(f)
+```
+
+```{python}
+##########################################################
+### Async Run State Simulations (May take a long time) ###
+##########################################################
+
+@asyn
+def do_state(sc_line: gpd.GeoDataFrame, iterations: int):
+    global runs
+    con = activateCon()
+    cur = con.cursor()
+    id = cur.execute("select create_layers(%(layers)s::INT[][], %(runid)s);", {'layers': make_array_str(sc_line, iterations), 'runid': sc_line["runid_precinct"]}).fetchall()[0][0]
+    con.commit()
+    con.close()
+    print(id)
+
+ITERATIONS = 30
+
+tasks = [do_state(state, ITERATIONS) for state in state_county_data.iloc]
+
+# To recover from issues
+# tasks = [do_state(state, ITERATIONS) for state, t in zip(state_county_data.iloc, tasks) if t.exception() is not None]
+
+while True:
+    print(f"Working... {"".join(["T" if i.done() else "F" for i in tasks])}")
+    if all([i.done() for i in tasks]):
+        break
+    aawait(asyncio.sleep(2))
+```
+
+```{python}
+################################
+### Pull All Simulation Data ###
+################################
+
+con = activateCon()
+cur = con.cursor()
+
+results = gpd.GeoDataFrame(cur.execute('''
+        SELECT 
+            rg.resid,
+            rg.runid,
+            s.abbreviation,
+            s.state_name,
+            m.election_year,
+            r_act.dem AS actual_dem_seats,
+            r_act.rep AS actual_rep_seats,
+            r_act.total AS total_seats
+        FROM result_group AS rg
+        JOIN meta AS m ON rg.runid = m.runid
+        JOIN state_lookup AS s ON m.state = s.fips_code
+        JOIN meta AS m_act ON m.state = m_act.state 
+            AND m.election_year = m_act.election_year
+            AND m_act.type = 1  -- Make sure we get real-world data
+        JOIN results AS r_act ON m_act.runid = r_act.runid
+        WHERE rg.layers <> '{{0, 0}}';
+    ''').fetchall(),
+    columns=['resid', 'runid', 's_abbr', 's_name', 'year', 'dem', 'rep', 'total']
+)
+
+display(results)
+con.close()
+
+# Sample usage:
+# results[(results["s_abbr"] == "OH") & (results["year"] == 2020)]
+```
+
+```{python}
+#######################################
+### Way to get distribution results ###
+#######################################
+
+def get_state_distribution(resid: int):
+    con = activateCon()
+    cur = con.cursor()
+
+    res = gpd.GeoDataFrame(cur.execute('''
+        select r.dem, r.rep, r.total
+        from results r
+        where r.resid = %(resid)s
+    ''', {'resid': resid}).fetchall(), columns=['dem', 'rep', 'total'])
+    con.close()
+
+    return res
+```
+
+```{python}
+######################
+### Visualize data ###
+######################
+
+def visualize_state(stats_df, state, year, dem, rep, total, save=False):
+    if save:
+        mpl.use("Agg")
+    else:
+        mpl.use("inline")
+    
+    # Setup Plotting Calculations
+    rows = len(stats_df)
+    # x_axis for the Normal PDF curves
+    x_axis = np.linspace(0, total, 500)
+    # Ensure bin_size is at least 1
+    bin_size = max(1, int(np.ceil(total / 100)))
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    # Plot Democratic Results
+    plt.hist(stats_df["dem"], bins=range(0, total + 2, bin_size), 
+             color='b', weights=[1/rows/bin_size]*rows, 
+             align="left", alpha=0.3, edgecolor='black', label="Dem Histogram")
+    
+    if stats_df["dem"].std() > 0:
+        plt.plot(x_axis, norm.pdf(x_axis, loc=stats_df["dem"].mean(), scale=stats_df["dem"].std()), 
+                 color='b', linewidth=1.5, label="Dem Norm Dist")
+    
+    plt.axvline(x=dem, color='b', linestyle='dashed', 
+                linewidth=2, label=f"Dem Actual ({dem})")
+
+    # Plot Republican Results
+    plt.hist(stats_df["rep"], bins=range(0, total + 2, bin_size), 
+             color='r', weights=[1/rows/bin_size]*rows, 
+             align="left", alpha=0.3, edgecolor='black', label="Rep Histogram")
+    
+    if stats_df["rep"].std() > 0:
+        plt.plot(x_axis, norm.pdf(x_axis, loc=stats_df["rep"].mean(), scale=stats_df["rep"].std()), 
+                 color='r', linewidth=1.5, label="Rep Norm Dist")
+        
+    plt.axvline(x=rep, color='r', linestyle='dashed', 
+                linewidth=2, label=f"Rep Actual ({rep})")
+
+    # Aesthetics
+    plt.title(f"{state} ({year}) County Seat Distributions")
+    plt.xlabel("Number of Counties Won")
+    plt.ylabel("Probability Density")
+    plt.legend(fontsize='small')
+    
+    plt.tight_layout()
+    if save:
+        plt.savefig(f"plots/hist_{state}_{year}.svg", format='svg', bbox_inches='tight')
+
+    return fig, ax
+```
+
+```{python}
+##########################################
+### Way to obtain s-curve for a result ###
+##########################################
+
+def get_county_distribution(resid: int):
+    con = activateCon()
+    cur = con.cursor()
+
+    res = gpd.GeoDataFrame(cur.execute('''
+                WITH target_info AS (
+                    -- Identify the state and year associated with this resid
+                    SELECT m.state, m.election_year
+                    FROM result_group r
+                    JOIN meta m ON r.runid = m.runid
+                    WHERE r.resid = %(resid)s
+                    LIMIT 1
+                ),
+                simulation_data AS (
+                    -- Get leans for all simulations in this result group
+                    SELECT 
+                        g.runid,
+                        (g.dem::float / NULLIF(g.total, 0)) AS dem_pct,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY g.runid 
+                            ORDER BY (g.dem::float / NULLIF(g.total, 0)) ASC
+                        ) AS district_rank
+                    FROM groups g
+                    JOIN results r ON g.runid = r.runid
+                    WHERE r.resid = %(resid)s
+                ),
+                simulation_stats AS (
+                    -- Calculate percentiles per rank
+                    SELECT 
+                        district_rank,
+                        MIN(dem_pct) AS p0,
+                        PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY dem_pct) AS p5,
+                        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY dem_pct) AS p25,
+                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY dem_pct) AS p50,
+                        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY dem_pct) AS p75,
+                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY dem_pct) AS p95,
+                        MAX(dem_pct) AS p100
+                    FROM simulation_data
+                    GROUP BY district_rank
+                ),
+                actual_baseline AS (
+                    -- Automatically find the Real World Type 1 data for the same state & year
+                    SELECT 
+                        (g.dem::float / NULLIF(g.total, 0)) AS actual_dem_pct,
+                        ROW_NUMBER() OVER (ORDER BY (g.dem::float / NULLIF(g.total, 0)) ASC) AS district_rank
+                    FROM groups g
+                    JOIN meta m ON g.runid = m.runid
+                    JOIN target_info ti ON m.state = ti.state AND m.election_year = ti.election_year
+                    WHERE m.type = 1 AND m.level = 1
+                )
+                -- Final output: Ribbons + Baseline
+                SELECT 
+                    s.district_rank,
+                    s.p0, s.p5, s.p25, s.p50, s.p75, s.p95, s.p100,
+                    a.actual_dem_pct
+                FROM simulation_stats s
+                LEFT JOIN actual_baseline a ON s.district_rank = a.district_rank
+                ORDER BY s.district_rank;
+            ''',
+            {'resid': resid}
+        ).fetchall(),
+        columns=['rank', 'p0', 'p5', 'p25', 'p50', 'p75', 'p95', 'p100', 'actual']
+    )
+    con.close()
+
+    return res
+```
+
+```{python}
+#################################
+### Plot s-curve for a result ###
+#################################
+
+def plot_partisan_ribbon(stats_df, state_name, year, save=False):
+    """
+    Plots a shaded confidence ribbon of simulated partisan leans 
+    with the actual county baseline overlaid.
+    """
+    if save:
+        mpl.use("Agg")
+    else:
+        mpl.use("inline")
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    
+    x = stats_df['rank']
+
+    # Plot ribbons
+    ax.fill_between(x, stats_df['p0'], stats_df['p100'], 
+                    color='gray', alpha=0.2, label='100% Simulation Range')
+    ax.fill_between(x, stats_df['p5'], stats_df['p95'], 
+                    color='gray', alpha=0.4, label='90% Simulation Range')
+    ax.fill_between(x, stats_df['p25'], stats_df['p75'], 
+                    color='gray', alpha=0.6, label='50% Simulation Range (IQR)')
+    
+    # Plot the Median Simulation Line
+    ax.plot(x, stats_df['p50'], color='black', linewidth=1, 
+            linestyle='--', label='Median Simulation')
+
+    # Plot the Actual County Baseline
+    ax.plot(stats_df.index + 1, stats_df['actual'], 
+            color='#d7191c', linewidth=2, label='Actual Counties')
+
+    # Add decision line
+    ax.axhline(0.5, color='black', linewidth=1, label='50% (Win Threshold)')
+    
+    # Shade the "Democratic Win Zone" lightly
+    ax.axhspan(0.5, 1.0, color='blue', alpha=0.05)
+    # Shade the "Republican Win Zone" lightly
+    ax.axhspan(0.0, 0.5, color='red', alpha=0.05)
+
+    # Labels and Titles
+    ax.set_title(f"Partisan Lean Analysis: {state_name} ({year})", fontsize=16, pad=20)
+    ax.set_xlabel("District Rank (Sorted by Democratic Lean)", fontsize=12)
+    ax.set_ylabel("Democratic Vote Share (%)", fontsize=12)
+    
+    ax.set_ylim(0, 1)
+    ax.set_xlim(1, len(x))
+    ax.legend(frameon=True)
+    plt.tight_layout()
+
+    if save:
+        plt.savefig(f"plots/s_{state_name}_{year}.svg", format='svg', bbox_inches='tight')
+    
+    return fig, ax
+```
+
+```{python}
+###################################
+### Plot all results (and save) ###
+###################################
+
+for i in results.iloc:
+    fig, ax = visualize_state(
+        get_state_distribution(int(i["resid"])),
+        i["s_name"],
+        int(i["year"]),
+        int(i["dem"]),
+        int(i["rep"]),
+        int(i["total"]),
+        save = True
+    )
+    plt.close(fig)
+
+    fig, ax = plot_partisan_ribbon(
+        get_county_distribution(int(i["resid"])),
+        i["s_name"],
+        int(i["year"]),
+        save = True
+    )
+    plt.close(fig)
+```
+
+```{python}
+def get_run_geometries(runid: int):
+    con = activateCon()
+    data = gpd.GeoDataFrame.from_postgis('''
+        select groupid, runid, dem, rep, total, geo
+        from groups
+        where runid = %(id)s;
+    ''', con=con, params={'id': runid}, geom_col='geo')
+    con.close()
+    return data
+```
+
+```{python}
+get_run_geometries(29581)
+```
+
+
+
+```{python}
+%matplotlib inline
+
+def visualize_run_map(runid: int, state_name, save=False):
+    if save:
+        mpl.use("Agg")
+    else:
+        mpl.use("inline")
+
+    data = get_run_geometries(runid)
+
+    if data.empty:
+        print(f"No data found for runid {runid}")
+        return
+
+    # Calculate Partisan Lean (Dem %)
+    data['lean'] = data['dem'] / (data['dem'] + data['rep']).replace(0, np.nan)
+
+    # Project to Web Mercator for the basemap
+    data = data.to_crs(epsg=3857)
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    # Draw the polygons
+    # 'RdBu' is Red (GOP) to Blue (Dem). 0.5 will be white/purple.
+    data.plot(
+        column='lean',
+        cmap='RdBu',
+        norm=Normalize(vmin=0, vmax=1),
+        edgecolor="gray",
+        linewidth=1.5,
+        alpha=0.6,
+        ax=ax,
+        legend=True,
+        legend_kwds={'label': "Republican <-> Democratic Vote Share", 'orientation': "horizontal", 'pad': 0.02}
+    )
+
+    # Add the Basemap
+    cx.add_basemap(ax, source=cx.providers.OpenStreetMap.Mapnik)
+
+    # Aesthetics
+    ax.set_axis_off()
+    plt.title(f"Simulation {runid}: {state_name} Partisan Lean", fontsize=15, pad=10)
+
+    if save:
+        plt.savefig(f"plots/map_{state_name}_{runid}.svg", format='svg', bbox_inches='tight')
+
+    return fig, ax
+
+```
+
+```{python}
+%matplotlib inline
+
+sample_maps = {
+    'Iowa': 29581,
+    'Arizona': 42623,
+    'Kansas': 43865,
+    'Minnesota': 52609,
+    'Ohio': 93443,
+}
+
+for place, run in sample_maps.items():
+    fig, ax = visualize_run_map(run, place, save = True)
+```

@@ -21,6 +21,12 @@ services:
 
 volumes:
   pgdata:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /var/lib/container-storage/volumes/csds234-final
+
 networks:
   net:
     driver: bridge
