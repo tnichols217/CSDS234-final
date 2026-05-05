@@ -355,3 +355,127 @@ BEGIN
     DROP TABLE raw2024;
 END;
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_county_distribution(input_resid INT)
+RETURNS TABLE (
+    d_rank BIGINT,
+    p0 FLOAT,
+    p5 FLOAT,
+    p25 FLOAT,
+    p50 FLOAT,
+    p75 FLOAT,
+    p95 FLOAT,
+    p100 FLOAT,
+    ensemble_list FLOAT[],
+    actual_dem_pct FLOAT
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH target_info AS (
+        -- Identify the state and year associated with this resid
+        SELECT m.state, m.election_year
+        FROM result_group r
+        JOIN meta m ON r.runid = m.runid
+        WHERE r.resid = input_resid
+        LIMIT 1
+    ),
+    simulation_data AS (
+        -- Get leans for all simulations in this result group
+        SELECT 
+            g.runid,
+            (g.dem::float / NULLIF(g.total, 0)) AS dem_pct,
+            ROW_NUMBER() OVER (
+                PARTITION BY g.runid 
+                ORDER BY (g.dem::float / NULLIF(g.total, 0)) ASC
+            ) AS district_rank
+        FROM groups g
+        JOIN results r ON g.runid = r.runid
+        WHERE r.resid = input_resid
+    ),
+    simulation_stats AS (
+        -- Calculate percentiles per rank
+        SELECT 
+            district_rank,
+            MIN(dem_pct) AS p0,
+            PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY dem_pct) AS p5,
+            PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY dem_pct) AS p25,
+            PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY dem_pct) AS p50,
+            PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY dem_pct) AS p75,
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY dem_pct) AS p95,
+            MAX(dem_pct) AS p100,
+            ARRAY_AGG(dem_pct ORDER BY dem_pct ASC) AS ensemble_list
+        FROM simulation_data
+        GROUP BY district_rank
+    ),
+    actual_baseline AS (
+        -- Automatically find the Real World Type 1 data for the same state & year
+        SELECT 
+            (g.dem::float / NULLIF(g.total, 0)) AS actual_dem_pct,
+            ROW_NUMBER() OVER (ORDER BY (g.dem::float / NULLIF(g.total, 0)) ASC) AS district_rank
+        FROM groups g
+        JOIN meta m ON g.runid = m.runid
+        JOIN target_info ti ON m.state = ti.state AND m.election_year = ti.election_year
+        WHERE m.type = 1 AND m.level = 1
+    )
+    -- Final output: Ribbons + Baseline
+    SELECT 
+        s.district_rank,
+        s.p0, s.p5, s.p25, s.p50, s.p75, s.p95, s.p100, s.ensemble_list,
+        a.actual_dem_pct
+    FROM simulation_stats s
+    LEFT JOIN actual_baseline a ON s.district_rank = a.district_rank
+    ORDER BY s.district_rank;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_state_county_data()
+RETURNS TABLE (
+    state_abbr CHAR(2),
+    election_year INT,
+    runid_precinct BIGINT,
+    size_precinct BIGINT,
+    runid_county BIGINT,
+    size_county BIGINT,
+    total_dem INT,
+    total_rep INT
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH precinct_runs AS (
+        SELECT 
+            m.state, 
+            m.election_year as year, 
+            m.runid, 
+            COUNT(g.groupid) as size
+        FROM meta m
+        JOIN groups g ON m.runid = g.runid
+        WHERE m.type = 0
+        GROUP BY m.state, m.election_year, m.runid
+    ),
+    county_runs AS (
+        SELECT 
+            m.state, 
+            m.election_year as year, 
+            m.runid, 
+            COUNT(g.groupid) as size
+        FROM meta m
+        JOIN groups g ON m.runid = g.runid
+        WHERE m.type = 1 AND m.level = 1
+        GROUP BY m.state, m.election_year, m.runid
+    )
+    SELECT 
+        s.abbreviation as state,
+        p.year,
+        p.runid AS runid_precinct,
+        p.size AS size_precinct,
+        c.runid AS runid_county,
+        c.size AS size_county,
+        r.dem AS dem,
+        r.rep AS rep
+    FROM precinct_runs p
+    JOIN county_runs c ON p.state = c.state AND p.year = c.year
+    JOIN state_lookup s ON p.state = s.fips_code
+    JOIN results r ON c.runid = r.runid
+    ORDER BY s.abbreviation, p.year;
+END;
+$$ LANGUAGE plpgsql;

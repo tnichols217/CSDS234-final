@@ -29,6 +29,8 @@ import numpy as np
 import subprocess
 import math
 import contextily as cx
+from itertools import zip_longest
+from scipy.stats import gaussian_kde
 ```
 
 ```{python}
@@ -93,44 +95,7 @@ con.close()
 
 con = activateCon()
 cur = con.cursor()
-state_county_data = gpd.GeoDataFrame(cur.execute('''
-        WITH precinct_runs AS (
-            SELECT 
-                m.state, 
-                m.election_year as year, 
-                m.runid, 
-                COUNT(g.groupid) as size
-            FROM meta m
-            JOIN groups g ON m.runid = g.runid
-            WHERE m.type = 0
-            GROUP BY m.state, m.election_year, m.runid
-        ),
-        county_runs AS (
-            SELECT 
-                m.state, 
-                m.election_year as year, 
-                m.runid, 
-                COUNT(g.groupid) as size
-            FROM meta m
-            JOIN groups g ON m.runid = g.runid
-            WHERE m.type = 1 AND m.level = 1
-            GROUP BY m.state, m.election_year, m.runid
-        )
-        SELECT 
-            s.abbreviation as state,
-            p.year,
-            p.runid AS runid_precinct,
-            p.size AS size_precinct,
-            c.runid AS runid_county,
-            c.size AS size_county,
-            r.dem AS dem,
-            r.rep AS rep
-        FROM precinct_runs p
-        JOIN county_runs c ON p.state = c.state AND p.year = c.year
-        JOIN state_lookup s ON p.state = s.fips_code
-        JOIN results r ON c.runid = r.runid
-        ORDER BY s.abbreviation, p.year;
-    ''').fetchall(),
+state_county_data = gpd.GeoDataFrame(cur.execute("SELECT * FROM get_state_county_data()").fetchall(),
     columns=[
         "state",
         "year",
@@ -338,64 +303,10 @@ def get_county_distribution(resid: int):
     con = activateCon()
     cur = con.cursor()
 
-    res = gpd.GeoDataFrame(cur.execute('''
-                WITH target_info AS (
-                    -- Identify the state and year associated with this resid
-                    SELECT m.state, m.election_year
-                    FROM result_group r
-                    JOIN meta m ON r.runid = m.runid
-                    WHERE r.resid = %(resid)s
-                    LIMIT 1
-                ),
-                simulation_data AS (
-                    -- Get leans for all simulations in this result group
-                    SELECT 
-                        g.runid,
-                        (g.dem::float / NULLIF(g.total, 0)) AS dem_pct,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY g.runid 
-                            ORDER BY (g.dem::float / NULLIF(g.total, 0)) ASC
-                        ) AS district_rank
-                    FROM groups g
-                    JOIN results r ON g.runid = r.runid
-                    WHERE r.resid = %(resid)s
-                ),
-                simulation_stats AS (
-                    -- Calculate percentiles per rank
-                    SELECT 
-                        district_rank,
-                        MIN(dem_pct) AS p0,
-                        PERCENTILE_CONT(0.05) WITHIN GROUP (ORDER BY dem_pct) AS p5,
-                        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY dem_pct) AS p25,
-                        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY dem_pct) AS p50,
-                        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY dem_pct) AS p75,
-                        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY dem_pct) AS p95,
-                        MAX(dem_pct) AS p100
-                    FROM simulation_data
-                    GROUP BY district_rank
-                ),
-                actual_baseline AS (
-                    -- Automatically find the Real World Type 1 data for the same state & year
-                    SELECT 
-                        (g.dem::float / NULLIF(g.total, 0)) AS actual_dem_pct,
-                        ROW_NUMBER() OVER (ORDER BY (g.dem::float / NULLIF(g.total, 0)) ASC) AS district_rank
-                    FROM groups g
-                    JOIN meta m ON g.runid = m.runid
-                    JOIN target_info ti ON m.state = ti.state AND m.election_year = ti.election_year
-                    WHERE m.type = 1 AND m.level = 1
-                )
-                -- Final output: Ribbons + Baseline
-                SELECT 
-                    s.district_rank,
-                    s.p0, s.p5, s.p25, s.p50, s.p75, s.p95, s.p100,
-                    a.actual_dem_pct
-                FROM simulation_stats s
-                LEFT JOIN actual_baseline a ON s.district_rank = a.district_rank
-                ORDER BY s.district_rank;
-            ''',
+    res = gpd.GeoDataFrame(cur.execute("SELECT * FROM get_county_distribution(%(resid)s)",
             {'resid': resid}
         ).fetchall(),
-        columns=['rank', 'p0', 'p5', 'p25', 'p50', 'p75', 'p95', 'p100', 'actual']
+        columns=['rank', 'p0', 'p5', 'p25', 'p50', 'p75', 'p95', 'p100', 'ensemble', 'actual']
     )
     con.close()
 
@@ -462,6 +373,118 @@ def plot_partisan_ribbon(stats_df, state_name, year, save=False):
 ```
 
 ```{python}
+#################################################
+### Calculate deviance stats for any grouping ###
+#################################################
+
+def calculate_ensemble_stats(county_dist):
+    # Convert data to numpy array
+    sim_matrix = np.array(list(zip_longest(*county_dist['ensemble'], fillvalue=None)))
+    sim_matrix[sim_matrix == None] = np.nan
+    sim_matrix = sim_matrix.astype(float)
+
+    # Calculate population metrics
+    pop_means = np.nanmean(sim_matrix, axis=0)
+    pop_stds = np.nanstd(sim_matrix, axis=0)
+    pop_stds = np.where(pop_stds == 0, 1e-6, pop_stds)
+
+    # Vectorized D-score for the Ensemble
+    z_scores_pop = (sim_matrix - pop_means) / pop_stds
+    population_d = np.sqrt(np.nanmean(z_scores_pop**2, axis=1))
+
+    # Actual Map D-score
+    actual_leans = county_dist['actual'].values
+    z_scores_query = (actual_leans - pop_means) / pop_stds
+    query_d = np.sqrt(np.nanmean(z_scores_query**2))
+
+    # Clean up and return
+    valid_pop_d = population_d[~np.isnan(population_d)]
+    p_value = np.sum(valid_pop_d >= query_d) / len(valid_pop_d)
+
+    return {
+        'p_value': p_value,
+        'percentile': (1 - p_value) * 100,
+        'query_d': query_d,
+        'population_d': valid_pop_d
+    }
+```
+
+```{python}
+%matplotlib inline
+
+###################################
+### Plot the deviance histogram ###
+###################################
+
+def plot_deviance_distribution(stats_output, state_name, year, save=False):
+    """
+    Plots a histogram of the D-score distribution with the actual map's position.
+    """
+    if save:
+        mpl.use("Agg")
+    else:
+        mpl.use("inline")
+
+    pop_d = stats_output['population_d']
+    query_d = stats_output['query_d']
+    p_val = stats_output['p_value']
+    percentile = stats_output['percentile']
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Plot the Distribution
+    count, bins, ignored = ax.hist(
+        pop_d,
+        bins=35,
+        density=True,
+        color="#95a5a6",
+        alpha=0.4,
+        edgecolor='white',
+        label="Simulated Neutral Maps"
+    )
+
+    # Add the KDE (Smooth Curve)
+    kde = gaussian_kde(pop_d)
+    x_range = np.linspace(min(pop_d), max(max(pop_d), query_d) * 1.1, 500)
+    ax.plot(x_range, kde(x_range), color="#7f8c8d", lw=2)
+
+    # Add the Map Indicator (Vertical Line)
+    ax.axvline(
+        query_d,
+        color="#e74c3c",
+        linestyle="--",
+        linewidth=2.5,
+        label=f"D={query_d:.2f}"
+    )
+
+    # Annotation Box
+    textstr = "\n".join((
+        f"Ensemble Size: {len(pop_d)}",
+        f"Percentile Rank: {percentile:.1f}%",
+        f"p-value: {p_val:.4f}"
+    ))
+    
+    props = dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='#bdc3c7')
+    ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=11,
+            verticalalignment='top', bbox=props)
+
+    # 5. Labels and Titles
+    ax.set_title(f"Empirical Partisan Deviance Distribution: {state_name} ({year})", fontsize=15, pad=20)
+    ax.set_xlabel("Total Deviance Score (D)", fontsize=12)
+    ax.set_ylabel("Probability Density", fontsize=12)
+    ax.legend(loc='upper right')
+
+    plt.tight_layout()
+
+    if save:
+        plt.savefig(f"plots/dev_{state_name}_{year}.svg", format='svg', bbox_inches='tight')
+
+    return fig, ax
+```
+
+```{python}
+%matplotlib inline
+
 ###################################
 ### Plot all results (and save) ###
 ###################################
@@ -478,8 +501,13 @@ for i in results.iloc:
     )
     plt.close(fig)
 
+    county_dist = get_county_distribution(int(i["resid"]))
+    stat = calculate_ensemble_stats(county_dist)
+    fig, ax = plot_deviance_distribution(stat, i["s_name"], int(i["year"]), save = True)
+    plt.close(fig)
+
     fig, ax = plot_partisan_ribbon(
-        get_county_distribution(int(i["resid"])),
+        county_dist,
         i["s_name"],
         int(i["year"]),
         save = True
@@ -488,6 +516,10 @@ for i in results.iloc:
 ```
 
 ```{python}
+################################
+### Get geometry assignments ###
+################################
+
 def get_run_geometries(runid: int):
     con = activateCon()
     data = gpd.GeoDataFrame.from_postgis('''
@@ -500,13 +532,11 @@ def get_run_geometries(runid: int):
 ```
 
 ```{python}
-get_run_geometries(29581)
-```
-
-
-
-```{python}
 %matplotlib inline
+
+#####################
+### Plot geometry ###
+#####################
 
 def visualize_run_map(runid: int, state_name, save=False):
     if save:
@@ -553,17 +583,22 @@ def visualize_run_map(runid: int, state_name, save=False):
         plt.savefig(f"plots/map_{state_name}_{runid}.svg", format='svg', bbox_inches='tight')
 
     return fig, ax
-
 ```
 
 ```{python}
 %matplotlib inline
+
+##############################
+### Create geometry images ###
+##############################
 
 sample_maps = {
     'Iowa': 29581,
     'Arizona': 42623,
     'Kansas': 43865,
     'Minnesota': 52609,
+    'Ohio': 208,
+    'Ohio': 81393,
     'Ohio': 93443,
 }
 
