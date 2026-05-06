@@ -166,20 +166,21 @@ BEGIN
             SUM(dem) AS dem,
             SUM(rep) AS rep,
             SUM(total) AS total,
-            ST_CollectionExtract(ST_Union(geo)) AS geo
+            ST_CollectionExtract(ST_Union(geo), 3) AS geo
         FROM (
             SELECT 
                 g.*,
-                ST_ClusterKMeans(
+                (ST_ClusterKMeans(
                     ST_Force4D(
                         ST_Force3DZ(ST_GeneratePoints(g.geo, 1, (100000*random()+1)::INT), 0.15*random()),
                         mvalue => 1000*random()
                     ),
                     v_size
-                ) OVER () AS clustering
+                ) OVER ()) % v_size AS clustering
             FROM groups AS g
             WHERE g.runid = v_previd
         )
+        WHERE clustering IS NOT NULL
         GROUP BY clustering
     );
 

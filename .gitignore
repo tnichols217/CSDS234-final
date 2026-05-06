@@ -4,4 +4,4 @@ viz
 result
 .direnv
 data
-plots
+plots*

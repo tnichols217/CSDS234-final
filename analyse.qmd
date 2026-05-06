@@ -2,36 +2,35 @@
 jupyter: python3
 ---
 
+# Project setup
+
+Required dependencies are listed in `flake.nix` and can be installed with `nix`
+
 ```{python}
 ####################
 ### Dependencies ###
 ####################
 
-import requests as rq
 import dotenv
-import os
-import json
 import pandas as pd
 import geopandas as gpd
-from io import StringIO
-from IPython.display import display
+from scipy.stats import norm, gaussian_kde
+import numpy as np
+import contextily as cx
+import math
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from matplotlib.colors import Normalize
 from matplotlib.ticker import MaxNLocator
-from bs4 import BeautifulSoup as bs
-import sqlite3 as sql
+from IPython.display import display
 import psycopg as pg
 import asyncio
 import nest_asyncio
-from scipy.stats import norm
-import numpy as np
 import subprocess
-import math
-import contextily as cx
 from itertools import zip_longest
-from scipy.stats import gaussian_kde
 ```
+
+Obtain our necessary environment variables
 
 ```{python}
 #####################
@@ -44,7 +43,10 @@ POSTGRES_DB = env["POSTGRES_DB"]
 POSTGRES_USER = env["POSTGRES_USER"]
 POSTGRES_PASSWORD = env["POSTGRES_PASSWORD"]
 POSTGRES_ENDPOINT = env["POSTGRES_ENDPOINT"]
+POSTGRES_URI = env["DB_URI"]
 ```
+
+Make our Postgres connection
 
 ```{python}
 #################################################
@@ -52,7 +54,7 @@ POSTGRES_ENDPOINT = env["POSTGRES_ENDPOINT"]
 #################################################
 
 # Make a connection to the database
-activateCon = lambda : pg.Connection.connect(env["DB_URI"], cursor_factory=pg.ClientCursor)
+activateCon = lambda : pg.Connection.connect(POSTGRES_URI, cursor_factory=pg.ClientCursor)
 con = activateCon()
 cur = con.cursor()
 ```
@@ -72,6 +74,8 @@ display(gpd.GeoDataFrame(cur.execute('''
 con.close()
 ```
 
+Here we initialize the DB after running `scripts/load_data.sh` to normalize the data in database
+
 ```{python}
 #######################################
 ### Import all Data (only run once) ###
@@ -87,6 +91,8 @@ actual_county_runid = gpd.GeoDataFrame(cur.execute('''
 con.commit()
 con.close()
 ```
+
+Obtain all county and precinct group information so we can run clustering upon it
 
 ```{python}
 ######################################
@@ -115,6 +121,8 @@ display(state_county_data)
 con.close()
 
 ```
+
+Determine our clustering sizes and number of samples to do
 
 ```{python}
 ###################
@@ -151,6 +159,8 @@ def aawait(f):
     return loop.run_until_complete(f)
 ```
 
+Run our clustering algorithm on all possible state precint distributions
+
 ```{python}
 ##########################################################
 ### Async Run State Simulations (May take a long time) ###
@@ -179,6 +189,8 @@ while True:
         break
     aawait(asyncio.sleep(2))
 ```
+
+Obtain all simulation results with some statistics before running more analysis
 
 ```{python}
 ################################
@@ -216,6 +228,8 @@ con.close()
 # Sample usage:
 # results[(results["s_abbr"] == "OH") & (results["year"] == 2020)]
 ```
+
+# Methods for calculating statistics and visualizing our simulated data
 
 ```{python}
 #######################################
@@ -514,6 +528,8 @@ for i in results.iloc:
     )
     plt.close(fig)
 ```
+
+Generate sample maps
 
 ```{python}
 ################################
