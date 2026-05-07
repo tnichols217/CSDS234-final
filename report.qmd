@@ -1,0 +1,246 @@
+---
+title: Analytical Analysis of Gerrymandaring
+author: Trevor Nichols
+---
+
+# Intro
+
+## Background Knowledge
+
+Gerrymandering is is the process of manipulating voting zones in order to gain an advantage in the outcomes of an election. This is primarily done in first past the post voting, or when the winner of a zone wins all the votes for that zone. This is typically done by packing and cracking. Packing is the process of grouping all of your opponents into as few zones as possible such that they win as few zones as possible, while cracking your voters into as many zones as possible while maintaining a minimal lead within those zones. This allows parties to win more seats overall even if they have fewer overall voters across an area.
+
+## Problem Statement
+
+Gerrymandering is a difficult concept to analyse and detect. In 2026, there is significant discussion about gerrymandering in light of the upcoming election in 2028 amidst heightened political conflicts. Understanding gerrymandering and its possible effects on a nation are essential to understanding election politics in this nation. Even though it may be commonly believed that gerrymandered zones will appear to be very non-circular, jagged, or otherwise malformed, it is still possible to gerrymander with fairly regular looking zoning while gaining a significant advantage thoughout the course of an election. Analysis on gerrymandering efforts is typically reduced to simple statistics that fail to tell the whole story by simply analysing voting differences in zones, while not accounting for the distribution of where voters live or how dense those areas are. Dealing with geometric data is also a difficult task, requiring larger amounts of processing and storage as our analysis on the United States is very large. Lastly, gerrymandering is also a time-sensitive problem, as people migrate and move significantly between polling seasons. In the US, presidential elections only happen every 4 years, which allows for the distribution of voters across the US to vary significantly.
+
+# Previous Work
+
+We were unable to find much work similar to what our goal was for this project; we have found other methods of analysing gerrymandering, however. A few common methods of analysing gerrymandering include the "circle metric", measuring how circular voting zones are on the district level and thus assuming highly non-circular zones are more likely to be gerrymandered, and the effeciency gap metric, which attempts to analyse whether zones may be packed or cracked by measuring the assumed effeciency in the distribution of a party's voters.
+
+This is a formulation for the effeciency gap metric:
+
+$$
+EG=\frac{(W-L-1)-L}{W+L}
+$$
+
+The left term in the numerator represents the amount of "wasted" votes for the winning party, which is any remaining votes more than the losing party, while the right term represents the number of "wasted" votes for the losing party, which is all votes as they did not win that region. This total is divided by total votes to get the effeciency gap metric. One key concern with this metric is that it does not account for the physical distribution of voters, as similar voters typically live in similar areas, leading to high $EG$ values even if no gerrymandering has occured.
+
+# Datasets
+
+Our primary datasets for this project include the New York Times presidential precinct map for the voting years of 2020 and 2024. This data was aggregated for various other verified sources including the Harvard Dataverse and official state records.
+
+The format of the 2020 year was in GeoJSON, a semistructured format storing the geometry of voting boundaries on a very fine grain, along with voting data and location data. The 2024 dataset was stored in the TopoJSON format, with similar additional information stored alongside.
+
+Attempts were made to pull older data from the Harvard Dataverse as well, but we were not able to download this data in order to run analysis upon it.
+
+All imported data was on the order of a gigabyte once imported.
+
+# Workflow, Architecture, Simulation, and Modeling
+
+## Workflow
+
+Our primary workflow consists of a linear sequence of steps:
+
+1. Obtain the raw data
+1. Design and instance our database schema
+1. Import and the raw data into our database
+1. Transmute and format the data to be suitable for our analysis
+1. Generate necessary metadata about precinct groupings
+1. Define our simulation parameters and models
+1. Perform our random Monte Carlo districting simulations in-database
+1. Calculate relevant statistics about the simulation results
+1. Visualize our results and statistics
+1. Draw Conclusions
+
+The primary novel method in our workflow is our Monte Carlo grouping simulation, giving a distribution of possible voting results for a particular state.
+
+## Architecture
+
+Our architecture consists of multiple parts:
+
+- PostgreSQL
+- gdal
+- Nix
+- Docker
+- Python
+- Quarto
+- Bash scripts
+
+### PostgreSQL
+
+PostgreSQL serves as our primary data storage method, storing all of our geometries and voting metrics. We utilize 4 primary tables to manage all of this information. All exact information may be found within `db/init.sql` within the accompanying repo for this project.
+
+The `meta` table stores information about meta groups of smaller precincts. It stores additional information about which state and year this meta group is associated with as well as which layer or result grouping this result group is for.
+
+The `groups` table stores the actual geometry for each precinct or higher level grouping, as well as total votes within that area. It references the `meta` for any necessary information about which metagroup this geometry is part of.
+
+The `result_group` table stores groups the zones for a state and year combo. It references the meta table for connecting eventually to the actual geometry on the `groups` table, while also storing additional information about the simulation parameters for this result.
+
+The `results` table stores the statistics for a `result_group`, including total votes, simulation run IDs.
+
+We lastly additionally have a `state_lookup` table which is just a complementary table for standardizing how states are referenced across the database.
+
+Most analysis and simulation are also run directly within PostgreSQL as it is easily parallelizable as queries are run at the same time. Clustering algorithms, initialization scripts, as well as statistics processing is run directly as predefined plpgsql functions.
+
+We additionally utilize the `postgis` Postgres extension to provide support geometry processing functions.
+
+### Environment
+
+The entire environment is managed purely with Nix, providing version control and software for all necessary things to run within this project. The `flake.nix` provides a list of all required dependencies and python packages for this project. The `flake.lock` version locks all software to what is necessary for this project. To enter the environment, use the `nix develop` command to utilize the shell.
+
+PostgreSQL is also directly managed with `docker-compose`, by utilizing the `postgis` docker.
+
+### Processing and Additional Tools
+
+Quarto is utilized as our workbook format and report renderer. Python is utilized as the primary language for analysis for this project, within a quarto notebook. Bash scripts are utilized only for importing the data from file into the PostgreSQL database by utilizing the `gdal` package.
+
+### Python
+
+The following python packages were utilized as part of this project:
+
+- pandas
+- geopandas
+- scikit-learn
+- numpy
+- scipy
+- matplotlib
+- python-dotenv
+- psycopg2
+- folium
+- mapclassify
+- contextily
+
+These packages are all utilized for performing statistics as well as creating visualizations.
+
+## Simulation
+
+The Monte Carlo simulation is structured as a layered randomized k-means grouping of all smallest level precincts. For this project, we utilize a 35x35 layering structure, where the first grouping layer groups geometrically halfway until the actual amount of districts within that state. We then group those groups into the final amount of districts. We utilize a layered approach in order to speed up and provide more variance across runs as opposed to pure k-means on the original set.
+
+## Models
+
+We utilize 3 main visualizations: histogram of probability of total districts won, our s-curve metric, and our deviance (D) metric.
+
+The total districts won is simply the distribution of total districts won across all monte carlo samples, fit to a normal distribution to understand the average and deviation for total districts won.
+
+### s-curve
+
+The s-curve is a plot made by sorting the district leanings within a monte carlo simulation within a state/year combo. We then calculate the distributions for each district rank across all simulations for that state/year. This generates an s-curve at multiple confidence intervals in order to see how far a specific district grouping is from where we expect it to be.
+
+Our s-curve visualization also directly visualizes cracking and packing, as packing would appear as steep slopes at the edges of the graph, while cracking would appear as a flattening near the decision boundary of 50%.
+
+### Deviance
+
+Lastly, we define the $D$ metric, which calculates how far from the mean s-curve a certain district grouping is. We additionally calculate the $D$ metric for every Monte Carlo sample in order to get a localized $D$ distribution for each state/year, making a singular zoning interpretable as for likelihood of how deviant a certain grouping is.
+
+The following is the definition of the $D$ metric.
+
+$$
+D=\sqrt{\sum\limits_{n=1}^{N}\frac{1}{N}\left(\frac{p_n-\mu_n}{\sigma^2_n}\right)}
+$$
+
+# Experimental Results
+
+All experimental result visualizations may be downloaded from the GitHub [release](https://github.com/tnichols217/CSDS234-final/releases/tag/pre-report) to view the analysis on every state in 2020 and 2024.
+
+## District Visualization
+
+Here is an example of a specific layered Monte Carlo simulation, from the original groupings, halfway, then to the final amount of districts.
+
+::: {.columns}
+::: {.column width=33%}
+
+![](./plots_2/map_Ohio_208.svg)
+
+:::
+::: {.column width=33%}
+
+![](./plots_2/map_Ohio_81393.svg)
+
+:::
+::: {.column width=33%}
+
+![](./plots_2/map_Ohio_93443.svg)
+
+:::
+:::
+
+We can see that there is a lot of variance in the shapes of the final output, this is intentional in order to gain a higher than normal variance in order to be conservative in our deviance metric.
+
+## Districts Won Histogram
+
+Here we can see an example of how the distribution can move and change over time depending on the distribution of people within that state.
+
+::: {.columns}
+::: {.column}
+
+![](./plots_2/hist_Pennsylvania_2020.svg)
+
+:::
+::: {.column}
+
+![](./plots_2/hist_Pennsylvania_2024.svg)
+
+:::
+:::
+
+## s-curve
+
+Here we can see the change in s-curve over time in New York. We notice that there is a steep curve on the right side of the graph, indicating that it is possible there is blue packing happening. We attribute this primarily to NYC, as most random distributions would be likely to split NYC across districts. We also see that 2024 follows the median distribution a lot closer than 2020 does.
+
+::: {.columns}
+::: {.column}
+
+![](./plots_2/s_New%20York_2020.svg)
+
+:::
+::: {.column}
+
+![](./plots_2/s_New%20York_2024.svg)
+
+:::
+:::
+
+## Deviance
+
+Here in the $D$ histogram, we can see the distribution of $D$, along with a smoothened KDE for the distribution of $D$ across all samples as well. The vertical red bar represents the actual $D$ for the real world district distribution. We also see the associated p-value for the real world distribution.
+
+::: {.columns}
+::: {.column}
+
+![](./plots_2/s_Indiana_2024.svg)
+![](./plots_2/dev_Indiana_2024.svg)
+
+:::
+::: {.column}
+
+![](./plots_2/s_North%20Dakota_2024.svg)
+![](./plots_2/dev_North%20Dakota_2024.svg)
+
+:::
+:::
+
+# Conclusion
+
+## Limitations and Future Work
+
+There are a couple of limitations with this approach. We do not do any predictive modelling for the change in the base voting distribution over time, although we can still see the change over time for historical data. The scope of this project is also intentionally limited, applying only to places that utilize a first past the post district voting system. This tool is also non-interactive, not being able to create distributions interactively and only purely through data import and analysis. Lastly, we could refine our $D$ metric further, in order to get more accurate p-values for statistical proving as well as utilizing a high-dimensionality correction for likelihood in the p-value.
+
+A frontend for this project would be a good next step, in order to make this tool interactive in some way and interactively see how our $D$ metric changes with minor district changes. We would also like to find a way to release the statistics for the simulated data in order to do additional statistical analysis without requiring the entire database backend.
+
+## Closing
+
+We believe this project offers good insight into when gerrymandering has occured as well as how likely or possible it is to gerrymander states given purely just the geographical and voting distribution of people. This project offers a full end-to-end processing pipeline to understand and analyse geographical data to detect and understand gerrymandering on the nation scale.
+
+## Credits
+
+Data:
+
+"2024 Precinct-Level Election Results." New York Times, https://www.nytimes.com/interactive/2025/us/elections/2024-election-map-precinct-results.html. Accessed May 1, 2026
+
+"2020 Precinct-Level Election Results." New York Times, https://github.com/TheUpshot/presidential-precinct-map-2020. Accessed May 1, 2026
+
+## Repository
+
+All related code and infrastructure can be found on GitHub
+
+[https://github.com/tnichols217/CSDS234-final](https://github.com/tnichols217/CSDS234-final)

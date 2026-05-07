@@ -5,3 +5,7 @@ result
 .direnv
 data
 plots*
+*.html
+*.pdf
+.quarto
+*_files

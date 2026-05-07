@@ -176,7 +176,7 @@ def do_state(sc_line: gpd.GeoDataFrame, iterations: int):
     con.close()
     print(id)
 
-ITERATIONS = 30
+ITERATIONS = 35
 
 tasks = [do_state(state, ITERATIONS) for state in state_county_data.iloc]
 
